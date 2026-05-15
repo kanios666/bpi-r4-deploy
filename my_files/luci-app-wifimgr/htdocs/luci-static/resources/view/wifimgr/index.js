@@ -48,6 +48,7 @@ var _onApplied      = null;
 var _netExpandState = {}; // sid → {expanded, editMode} — survives poll re-renders
 var _lastFormTouch  = 0;  // timestamp of last form interaction — blocks poll re-render
 var _pendingTxMode  = null; // user-selected TX mode not yet saved to UCI — survives re-renders
+var _signalHistory  = {}; // ifname → Array<number|null> ring buffer (last 20 samples)
 
 // ── STATIC TAB LIST ───────────────────────────────────────────────────────────
 // Networks | Radios | Clients | Diagnostics (always visible)
@@ -94,8 +95,18 @@ function bandPill(radio_id) {
 
 function statusBadge(state) {
     var s = (state || '').toUpperCase();
-    var label = s === 'ENABLED' ? 'Active' : s === 'UP' ? 'Up' : s === 'DISABLED' ? 'Disabled' : s === 'DOWN' ? 'Down' : (state || 'Unknown');
-    var color = (s === 'ENABLED' || s === 'UP') ? '#1d9e75' : (s === 'DISABLED') ? '#555' : '#e24b4a';
+    var label = s === 'ENABLED'      ? 'Active'
+              : s === 'UP'          ? 'Up'
+              : s === 'DISABLED'    ? 'Disabled'
+              : s === 'DOWN'        ? 'Down'
+              : s === 'INIT_FAILED' ? 'Config error'
+              : s === 'SCANNING'    ? 'Scanning…'
+              : s === 'DISCONNECTED'? 'Disconnected'
+              : (state || 'Unknown');
+    var color = (s === 'ENABLED' || s === 'UP')                              ? '#1d9e75'
+              : (s === 'DISABLED')                                            ? '#555'
+              : (s === 'INIT_FAILED' || s === 'SCANNING' || s === 'DISCONNECTED') ? '#f5a623'
+              : '#e24b4a';
     return node('span', {
         style: 'display:inline-block;padding:1px 8px;border-radius:3px;font-size:11px;' +
                'background:' + color + '22;color:' + color + ';border:1px solid ' + color + '44'
@@ -116,6 +127,43 @@ function signalBars(dbm) {
         }));
     }
     return node('span', {}, wrap, sp(dbm + ' dBm', 'color:' + color + ';font-size:12px'));
+}
+
+// ── SIGNAL HISTORY ────────────────────────────────────────────────────────────
+
+var SIG_HIST_MAX = 20;
+
+function sigColor(dbm) {
+    if (dbm == null) return '#555';
+    return dbm >= -50 ? '#1d9e75' : dbm >= -65 ? '#5b9bd5' : dbm >= -75 ? '#f5a623' : '#e24b4a';
+}
+
+function sigHistPush(ifname, dbm) {
+    if (!_signalHistory[ifname]) _signalHistory[ifname] = [];
+    var h = _signalHistory[ifname];
+    h.push(dbm != null ? dbm : null);
+    if (h.length > SIG_HIST_MAX) h.shift();
+}
+
+function sigHistStats(ifname) {
+    var vals = (_signalHistory[ifname] || []).filter(function(v) { return v != null; });
+    if (!vals.length) return null;
+    var min = vals[0], max = vals[0], sum = 0;
+    vals.forEach(function(v) { if (v < min) min = v; if (v > max) max = v; sum += v; });
+    return { min: min, max: max, avg: Math.round(sum / vals.length) };
+}
+
+function renderSignalHistory(ifname, sparkEl, statsEl) {
+    var h = _signalHistory[ifname] || [];
+    var CHARS = '▁▂▃▄▅▆▇█';
+    while (sparkEl.firstChild) sparkEl.removeChild(sparkEl.firstChild);
+    if (!h.length) { sparkEl.appendChild(sp('·', 'color:#444')); statsEl.textContent = ''; return; }
+    h.forEach(function(dbm) {
+        var idx = dbm == null ? 0 : Math.min(7, Math.max(0, Math.round((dbm + 90) / 45 * 7)));
+        sparkEl.appendChild(node('span', { style: 'color:' + sigColor(dbm) }, CHARS[idx]));
+    });
+    var st = sigHistStats(ifname);
+    statsEl.textContent = st ? 'min ' + st.min + ' · avg ' + st.avg + ' · max ' + st.max + ' dBm' : '';
 }
 
 function genBadge(htmode) {
@@ -748,7 +796,7 @@ function wizardStation(onDone) {
                     };
                     function doRefresh() {
                         if (!tbl.isConnected) { clearInterval(refreshTimer); return; }
-                        layer2.uplink_scan('radio0').then(function(newRes) {
+                        layer2.uplink_scan(radio).then(function(newRes) {
                             if (!tbl.isConnected) { clearInterval(refreshTimer); return; }
                             if (newRes.ok && newRes.data.length) renderRows(newRes.data);
                         });
@@ -863,10 +911,11 @@ function wizardWDS(onDone) {
 
         var wdsErrDiv = node('div', {});
         var wdsScanBtn = btnSecondary('Scan', function() {
+            var wdsScanRadio = bandSel.value;
             wdsScanBtn.disabled = true;
             wdsScanBtn.textContent = 'Scanning…';
             while (wdsErrDiv.firstChild) wdsErrDiv.removeChild(wdsErrDiv.firstChild);
-            layer2.uplink_scan(bandSel.value).then(function(res) {
+            layer2.uplink_scan(wdsScanRadio).then(function(res) {
                 wdsScanBtn.disabled = false;
                 wdsScanBtn.textContent = 'Scan';
                 if (!res.ok || !res.data.length) {
@@ -931,7 +980,7 @@ function wizardWDS(onDone) {
                     };
                     function doRefresh() {
                         if (!tbl.isConnected) { clearInterval(refreshTimer); return; }
-                        layer2.uplink_scan('radio0').then(function(newRes) {
+                        layer2.uplink_scan(wdsScanRadio).then(function(newRes) {
                             if (!tbl.isConnected) { clearInterval(refreshTimer); return; }
                             if (newRes.ok && newRes.data.length) renderRows(newRes.data);
                         });
@@ -1078,10 +1127,11 @@ function wizardRepeater(onDone) {
         }
 
         function doScan() {
+            var repScanRadio = uplinkRadioSel.value;
             scanBtn.disabled = true;
             scanBtn.textContent = 'Scanning…';
             while (scanErrDiv.firstChild) scanErrDiv.removeChild(scanErrDiv.firstChild);
-            layer2.uplink_scan(uplinkRadioSel.value).then(function(res) {
+            layer2.uplink_scan(repScanRadio).then(function(res) {
                 scanBtn.disabled = false;
                 scanBtn.textContent = 'Scan';
                 if (!res.ok || !res.data.length) {
@@ -1093,7 +1143,7 @@ function wizardRepeater(onDone) {
                 clearInterval(_repRefreshTimer);
                 _repRefreshTimer = setInterval(function() {
                     if (!scanArea.isConnected || step2.style.display !== 'none') return;
-                    layer2.uplink_scan('radio0').then(function(newRes) {
+                    layer2.uplink_scan(repScanRadio).then(function(newRes) {
                         if (!scanArea.isConnected || step2.style.display !== 'none') return;
                         if (newRes.ok && newRes.data.length) renderRepRows(newRes.data);
                     });
@@ -1200,7 +1250,7 @@ function openScanNearby() {
 
         function doRefresh() {
             if (!tbl.isConnected) { clearInterval(refreshTimer); return; }
-            layer2.uplink_scan('radio0').then(function(res) {
+            layer2.uplink_scan_all().then(function(res) {
                 if (!tbl.isConnected) { clearInterval(refreshTimer); return; }
                 if (res.ok && res.data.length) renderRows(res.data);
             });
@@ -1220,7 +1270,7 @@ function openScanNearby() {
         body.appendChild(statusRow);
         body.appendChild(tbl);
 
-        layer2.uplink_scan('radio0').then(function(res) {
+        layer2.uplink_scan_all().then(function(res) {
             while (statusRow.firstChild) statusRow.removeChild(statusRow.firstChild);
             if (!res.ok || !res.data.length) {
                 statusRow.appendChild(muted('No networks found'));
@@ -1332,7 +1382,10 @@ function netRow(type, iface, data, cliCount, country, isLast) {
     row.onmouseenter = function() { row.style.background = '#1a2535'; };
     row.onmouseleave = function() { row.style.background = ''; };
 
-    row.appendChild(sp('●', 'color:' + (isUp ? '#1d9e75' : '#444') + ';font-size:10px;flex-shrink:0'));
+    var isAmber = status === 'INIT_FAILED' || status === 'SCANNING' ||
+                  (status === 'DISCONNECTED' && iface.mode === 'sta');
+    var dotColor = isUp ? '#1d9e75' : isAmber ? '#f5a623' : '#444';
+    row.appendChild(sp('●', 'color:' + dotColor + ';font-size:10px;flex-shrink:0'));
 
     var nameWrap = node('div', { style: 'display:flex;align-items:center;gap:6px;flex:1;min-width:0;overflow:hidden' });
     nameWrap.appendChild(sp(ssid, 'color:#ddd;font-weight:bold;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap'));
@@ -1496,26 +1549,50 @@ function netRow(type, iface, data, cliCount, country, isLast) {
             ];
             b.appendChild(kvGrid(staItems));
 
-            // Uplink connection status
+            // Uplink connection status (live-updating)
             var uplink = (data.uplinks || []).find(function(u) { return u.sid === sid; });
             if (uplink) {
-                b.appendChild(sp('Connection status', 'display:block;color:#88888899;font-size:11px;font-weight:bold;letter-spacing:0.5px;margin:10px 0 6px'));
-                var _staRid = iface.device ? (Array.isArray(iface.device) ? iface.device[0] : iface.device) : null;
+                var _ulIfname = uplink.ifname;
+                var _staRid   = iface.device ? (Array.isArray(iface.device) ? iface.device[0] : iface.device) : null;
                 var _staRadio = (_staRid && data.radios) ? data.radios.find(function(r) { return r.id === _staRid; }) : null;
                 var _staNoise = _staRadio && _staRadio.noise != null ? _staRadio.noise : null;
-                // Add new connection fields here
+
+                b.appendChild(sp('Connection', 'display:block;color:#88888899;font-size:11px;font-weight:bold;letter-spacing:0.5px;margin:10px 0 6px'));
+
+                // Live-updatable DOM nodes
+                var _stateEl = node('div', { style: 'color:#ddd;font-size:13px;margin-top:2px' }, wpaLabel(uplink.wpa_state));
+                var _sigEl   = node('div', { style: 'margin-top:2px' });
+                _sigEl.appendChild(signalBars(uplink.signal));
+                var _txRxEl  = node('div', { style: 'color:#ddd;font-size:13px;margin-top:2px' });
+                (function() {
+                    var txP = parseBitrate(uplink.tx_bitrate), rxP = parseBitrate(uplink.rx_bitrate);
+                    _txRxEl.textContent = (txP ? txP.speed : (uplink.tx_bitrate || '—')) + ' / ' +
+                                          (rxP ? rxP.speed : (uplink.rx_bitrate || '—'));
+                })();
+
                 var connItems = [
-                    ['State',      uplink.wpa_state  || '—'],
+                    ['State',      _stateEl],
                     ['BSSID',      uplink.bssid      || '—'],
                     ['IP address', uplink.ip_address || '—'],
-                    ['Signal',     uplink.signal     != null ? uplink.signal + (_staNoise != null ? ' / ' + _staNoise : '') + ' dBm' : '—'],
-                    ['TX / RX',    (uplink.tx_bitrate || '?') + ' / ' + (uplink.rx_bitrate || '?')],
+                    ['Signal',     _sigEl],
+                    ['TX / RX',    _txRxEl],
                     ['WiFi gen.',  uplink.wifi_generation ? 'WiFi ' + uplink.wifi_generation : '—'],
                 ];
+                if (_staNoise != null) connItems.push(['Noise floor', _staNoise + ' dBm'], null, null);
                 b.appendChild(kvGrid(connItems));
 
+                // Signal history sparkline
+                b.appendChild(sp('Signal history', 'display:block;color:#88888899;font-size:11px;font-weight:bold;letter-spacing:0.5px;margin:10px 0 4px'));
+                var _sparkEl = node('div', { style: 'font-family:monospace;font-size:16px;letter-spacing:2px;line-height:1.4' });
+                var _statsEl = node('div', { style: 'color:#555;font-size:11px;margin-top:3px' });
+                sigHistPush(_ulIfname, uplink.signal);
+                renderSignalHistory(_ulIfname, _sparkEl, _statsEl);
+                b.appendChild(_sparkEl);
+                b.appendChild(_statsEl);
+
+                // Per-link table (MLO, static)
                 if (uplink.is_mlo && uplink.links && uplink.links.length) {
-                    b.appendChild(sp('Per-link (WiFi 7)', 'display:block;color:#888;font-size:12px;margin:8px 0 4px'));
+                    b.appendChild(sp('Per-link (WiFi 7)', 'display:block;color:#88888899;font-size:11px;font-weight:bold;letter-spacing:0.5px;margin:10px 0 4px'));
                     var ltbl = node('table', { style: 'width:100%;border-collapse:collapse;font-size:12px' });
                     var lhead = node('tr', { style: 'color:#555' });
                     ['Link','Freq','BW','Signal','TX','RX'].forEach(function(h) {
@@ -1534,6 +1611,24 @@ function netRow(type, iface, data, cliCount, country, isLast) {
                     });
                     b.appendChild(ltbl);
                 }
+
+                // Live poll — stops automatically when element leaves DOM
+                var _pollTimer = setInterval(function() {
+                    if (!_sparkEl.isConnected) { clearInterval(_pollTimer); return; }
+                    layer2.uplink_get_status(_ulIfname).then(function(res) {
+                        if (!_sparkEl.isConnected) { clearInterval(_pollTimer); return; }
+                        if (!res.ok) return;
+                        var st = res.data;
+                        sigHistPush(_ulIfname, st.signal);
+                        _stateEl.textContent = wpaLabel(st.wpa_state);
+                        while (_sigEl.firstChild) _sigEl.removeChild(_sigEl.firstChild);
+                        _sigEl.appendChild(signalBars(st.signal));
+                        var txP = parseBitrate(st.tx_bitrate), rxP = parseBitrate(st.rx_bitrate);
+                        _txRxEl.textContent = (txP ? txP.speed : (st.tx_bitrate || '—')) + ' / ' +
+                                              (rxP ? rxP.speed : (st.rx_bitrate || '—'));
+                        renderSignalHistory(_ulIfname, _sparkEl, _statsEl);
+                    });
+                }, 5000);
             }
         }
 
@@ -1651,6 +1746,38 @@ function netRow(type, iface, data, cliCount, country, isLast) {
     }
 
     wrapper.appendChild(row);
+
+    var isStaLost = iface.mode === 'sta' && (status === 'DISCONNECTED' || status === 'SCANNING');
+    if (status === 'INIT_FAILED' || isStaLost) {
+        var warnMsg = status === 'INIT_FAILED'
+            ? 'Configuration lost — this network is no longer active. Remove it and set it up again using the wizard.'
+            : 'Network unreachable — cannot connect to the target network. The network may be out of range or the password may have changed. Remove and reconnect via the wizard.';
+        var warnBar = node('div', {
+            style: 'background:#f5a62312;border-top:1px solid #f5a62330;padding:9px 14px;' +
+                   'display:flex;align-items:center;gap:10px'
+        });
+        warnBar.appendChild(sp('⚠', 'color:#f5a623;font-size:13px;flex-shrink:0'));
+        warnBar.appendChild(node('span', { style: 'color:#c8a04a;font-size:12px;flex:1;line-height:1.4' }, warnMsg));
+        var fixBtn = btn('Remove and reconfigure', '#f5a623', function(e) {
+            e.stopPropagation();
+            if (!confirm('Remove "' + ssid + '" and open wizard to reconfigure?')) return;
+            delete _netExpandState[sid];
+            applyFlow(applyDiv, function() {
+                var prom = is_mld ? layer2.mld_remove(sid) : layer2.iface_remove(sid);
+                return prom.then(function(r) {
+                    return Object.assign({ restartRequired: 'wifi' }, r);
+                });
+            }, function() {
+                if (_onApplied) _onApplied();
+                if (is_mld) wizardMLO(_onApplied);
+                else        wizardStation(_onApplied);
+            });
+        });
+        fixBtn.style.cssText += ';padding:3px 10px;font-size:12px;flex-shrink:0';
+        warnBar.appendChild(fixBtn);
+        wrapper.appendChild(warnBar);
+    }
+
     wrapper.appendChild(panel);
     wrapper.appendChild(applyDiv);
     if (expanded) refresh();
@@ -1899,8 +2026,77 @@ function renderRadios(data) {
 
         var bodyFn = function() {
             var b = node('div', { style: 'margin-top:10px' });
+
+            // ── Channel Advisor ────────────────────────────────────────────
+            var advResult = node('div', { style: 'margin-top:4px;min-height:18px' });
+            var advBtn = btnSecondary('Scan channels', function() {
+                advBtn.disabled = true;
+                advBtn.textContent = 'Scanning…';
+                layer2.uplink_scan(r.id).then(function(res) {
+                    advBtn.disabled = false;
+                    advBtn.textContent = 'Scan channels';
+                    while (advResult.firstChild) advResult.removeChild(advResult.firstChild);
+                    var aps = (res && res.data) || [];
+                    if (!aps.length) {
+                        advResult.appendChild(sp('No networks found.', 'color:#444;font-size:11px'));
+                        return;
+                    }
+                    // Candidate channels per band
+                    var cands = r.id === 'radio0'
+                        ? [1,2,3,4,5,6,7,8,9,10,11,12,13]
+                        : r.id === 'radio2'
+                            ? [1,5,9,13,17,21,25,29,33,37,41,45,49,53,57,61,65,69,73,77,81,85,89,93]
+                            : [36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,144,149,153,157,161,165];
+                    var is2g = r.id === 'radio0';
+                    // Score: lower = less interference
+                    var scores = {};
+                    cands.forEach(function(ch) { scores[ch] = 0; });
+                    aps.forEach(function(ap) {
+                        var apCh = ap.channel;
+                        if (!apCh) return;
+                        // linear weight from signal dBm (stronger AP = more interference)
+                        var w = Math.pow(10, ((ap.signal || -90) + 100) / 20);
+                        cands.forEach(function(ch) {
+                            var dist = Math.abs(ch - apCh);
+                            var overlap = is2g
+                                ? (dist === 0 ? 1 : dist <= 2 ? 0.5 : dist <= 4 ? 0.25 : 0)
+                                : (dist === 0 ? 1 : 0);
+                            scores[ch] += w * overlap;
+                        });
+                    });
+                    var sorted = cands.slice().sort(function(a, b) { return scores[a] - scores[b]; });
+                    var top3 = sorted.slice(0, 3);
+                    var worst = scores[sorted[sorted.length - 1]] || 1;
+                    var wrap = node('div', { style: 'display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:4px' });
+                    wrap.appendChild(sp('Best:', 'color:#555;font-size:11px'));
+                    top3.forEach(function(ch, i) {
+                        var apCount = aps.filter(function(ap) {
+                            return is2g ? Math.abs((ap.channel||0) - ch) <= 2 : ap.channel === ch;
+                        }).length;
+                        var load = worst > 0 ? scores[ch] / worst : 0;
+                        var color = load < 0.15 ? '#1d9e75' : load < 0.45 ? '#f5a623' : '#e24b4a';
+                        var chBtn = node('button', {
+                            title: apCount + ' AP' + (apCount !== 1 ? 's' : '') + ' nearby',
+                            style: 'background:#0d1520;border:1px solid ' + color + '66;color:' + color +
+                                   ';font-size:11px;padding:1px 8px;border-radius:3px;cursor:pointer'
+                        }, 'CH ' + ch);
+                        chBtn.onclick = function() { chIn.value = String(ch); };
+                        wrap.appendChild(chBtn);
+                        if (i < 2) wrap.appendChild(sp('·', 'color:#2a3a4a;font-size:11px'));
+                    });
+                    wrap.appendChild(sp('(' + aps.length + ' networks)', 'color:#333;font-size:10px;margin-left:2px'));
+                    advResult.appendChild(wrap);
+                }).catch(function() {
+                    advBtn.disabled = false;
+                    advBtn.textContent = 'Scan channels';
+                    advResult.appendChild(sp('Scan failed.', 'color:#e24b4a;font-size:11px'));
+                });
+            });
+            advBtn.style.cssText += ';padding:2px 10px;font-size:11px';
+
             var chWrap = node('div', {});
-            chWrap.appendChild(chIn);
+            chWrap.appendChild(node('div', { style: 'display:flex;align-items:center;gap:8px' }, chIn, advBtn));
+            chWrap.appendChild(advResult);
             if (r.id === 'radio1') chWrap.appendChild(sp('DFS channels (CAC ~60s): 52–144', 'display:block;color:#555;font-size:11px;margin-top:3px'));
             b.appendChild(formRow('Channel', chWrap));
             b.appendChild(formRow('Channel width', htSel));
@@ -2098,6 +2294,56 @@ function renderDiagnostics(diag) {
                         wrap.appendChild(node('div', { style: 'font-size:11px;color:#666;font-family:monospace;padding-left:8px;margin-bottom:1px' }, lstr));
                     });
                 }
+
+                // ── MLD Capabilities breakdown (collapsible) ───────────────
+                var _mi = mi, _m = m;
+                wrap.appendChild(node('div', { style: 'margin-top:8px;padding-top:6px;border-top:1px solid #0a1520' },
+                    collapsible('diag_mld_caps_' + _mi, 'MLD Capabilities detail  (IEEE 802.11be)', function() {
+                        var capsDiv = node('div', { style: 'margin-top:6px' });
+
+                        // Hex derivation note
+                        capsDiv.appendChild(node('pre', { style: 'font-size:10px;color:#2a3a4a;font-family:monospace;margin:0 0 8px;line-height:1.7;white-space:pre-wrap' },
+                            '  0x0062  driver base (MT7996 · mt7996/init.c)\n' +
+                            '+ 0x2000  Link Reconfiguration  (hostapd unconditional)\n' +
+                            '+ 0x0020  TID-to-Link All-to-All  (hostapd unconditional)\n' +
+                            '+ link_id  per-link active_links  (varies per beacon element)\n' +
+                            '= 0x2062 / 0x2061  (beacon frames · tshark wlan.mle.mld_capa)'));
+
+                        function capRow(label, value, valColor, note) {
+                            var r = node('div', { style: 'display:flex;gap:0;font-size:10px;margin-bottom:3px;align-items:baseline' });
+                            r.appendChild(sp(label, 'color:#555;min-width:185px;flex-shrink:0'));
+                            r.appendChild(sp(value, 'color:' + valColor + ';min-width:115px;flex-shrink:0;font-family:monospace'));
+                            r.appendChild(sp(note,  'color:#2a4030;font-size:9px'));
+                            return r;
+                        }
+                        capsDiv.appendChild(capRow('Max simultaneous links',   '2  (3-band capable)', '#aaa',    'MT7996 · mld_capa_and_ops bits 0–3'));
+                        capsDiv.appendChild(capRow('TID-to-Link negotiation',  'DIFF  (mode 3)',       '#aaa',    'MT7996 · IEEE80211_MLD_CAP_OP_TID_TO_LINK_MAP_NEG_SUPP_DIFF'));
+                        capsDiv.appendChild(capRow('Link Reconfiguration',     'advertised  ⚠',       '#f5a623', 'firmware unconditional · EHT_ML_MLD_CAPA_LINK_RECONF_OP_SUPPORT · not functional'));
+                        capsDiv.appendChild(capRow('TID-to-Link All-to-All',   'advertised  ⚠',       '#f5a623', 'firmware unconditional · TODO comment in hostapd source'));
+                        capsDiv.appendChild(capRow('Aligned TWT',              'not supported',        '#3a3a3a', 'MT7996 Connac 3 · intentionally omitted from driver + hostapd'));
+
+                        // EMLSR sub-section
+                        capsDiv.appendChild(node('div', { style: 'margin-top:8px;padding-top:6px;border-top:1px solid #08121a;color:#333;font-size:10px;letter-spacing:0.3px;font-weight:bold;margin-bottom:5px' },
+                            'EMLSR  (Enhanced Multi-Link Single Radio)'));
+
+                        var emlDis = !!_m.eml_disable;
+                        capsDiv.appendChild(capRow('EMLSR support',              'advertised in beacon',   '#aaa',    'MT7996 driver · NL80211_ATTR_EML_CAPABILITY · AP iftype only'));
+                        capsDiv.appendChild(capRow('EMLSR on one link',          'disabled  (default)',    '#3a3a3a', 'emlsr_on_one_link=0 · hostapd opt-in · not yet in netifd UCI'));
+                        capsDiv.appendChild(capRow('Extended MLD Cap in beacon',
+                            emlDis ? 'suppressed' : 'not present',
+                            emlDis ? '#e24b4a' : '#3a3a3a',
+                            emlDis ? 'eml_disable=1 · ML Control bit 10 = 0 · subelement omitted'
+                                   : 'emlsr_on_one_link=0 · ML Control bit 10 = 0 · no Extended MLD Cap subelement'));
+                        capsDiv.appendChild(capRow('SDK patch',                  '0237-mtk-hostapd',      '#3a3a3a', 'add-support-for-emlsr-enablement-on-one-link · ML Control bit + subelement gated symmetrically'));
+
+                        // tshark hint
+                        capsDiv.appendChild(node('div', {
+                            style: 'margin-top:8px;font-size:9px;color:#1a2a1a;font-family:monospace;overflow-x:auto;white-space:nowrap;padding:4px 6px;background:#050d0f;border-radius:3px'
+                        }, 'tshark -r cap.pcap -Y \'wlan.fc.type_subtype==8\' -T fields -e wlan.mle.mld_capa -e wlan_radio.frequency 2>/dev/null | sort -u'));
+
+                        return capsDiv;
+                    }, false)
+                ));
             });
             return wrap;
         }, false)));

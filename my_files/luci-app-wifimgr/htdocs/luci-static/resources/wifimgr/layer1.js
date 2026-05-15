@@ -597,15 +597,20 @@ async function iw_link(ifname) {
 }
 
 async function iwinfo_scan(radio_id) {
-    // When a STA interface is active, wpa_supplicant owns the nl80211 scan state
-    // and ubus iwinfo scan on the AP interface returns empty. Try phy0.0-sta0 first
-    // (wpa_supplicant keeps fresh scan results); fall back to phy0.0-ap0 for pure
-    // AP setups. Each call wrapped separately — phy0.0-sta0 may not exist on AP-only
-    // routers and returns ubus "Not found" error.
+    // Try radio-specific interfaces first (STA before AP — wpa_supplicant keeps cached
+    // results on managed interfaces; AP interfaces return empty when wpa_supplicant
+    // is active). Fall back to sta-mld0 / phy0.0-sta* which always have cached results
+    // when any MLO STA is connected, regardless of the requested radio.
+    const n = radio_id ? (parseInt(radio_id.replace('radio', '')) || 0) : 0;
+    const pfx = 'phy0.' + n;
+    const candidates = [pfx + '-sta0', pfx + '-sta1', pfx + '-ap0',
+                        'sta-mld0', 'phy0.0-sta1', 'phy0.0-sta0'];
     let results = [];
-    try { results = await callIwInfoScan('phy0.0-sta0'); } catch(_) {}
-    if (!Array.isArray(results) || !results.length) {
-        try { results = await callIwInfoScan('phy0.0-ap0'); } catch(_) {}
+    for (const iface of candidates) {
+        try {
+            results = await callIwInfoScan(iface);
+            if (Array.isArray(results) && results.length) break;
+        } catch(_) {}
     }
     return ok(Array.isArray(results) ? results : []);
 }

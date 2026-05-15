@@ -165,8 +165,11 @@ async function radio_get_all() {
         const hRes = await layer1.hostapd_stat(legacyIf, null);
         const h    = hRes.ok ? hRes.data : {};
 
-        // txpower_actual: iw dev (real HW value) → hostapd max_txpower fallback
-        const txActual = iwTxpower[legacyIf] ?? (h.max_txpower ? parseInt(h.max_txpower) : null);
+        // txpower_actual: manual mode → UCI value (configured cap); otherwise iw dev → hostapd max_txpower fallback
+        const txMode = sec.txpower_mode || (sec.sku_idx === undefined ? 'efuse_max' : (sec.txpower !== undefined ? 'manual' : 'regdb'));
+        const txActual = (txMode === 'manual' && sec.txpower !== undefined)
+            ? uciInt(sec.txpower)
+            : (iwTxpower[legacyIf] ?? (h.max_txpower ? parseInt(h.max_txpower) : null));
 
         radios.push({
             id,
@@ -332,8 +335,9 @@ async function iface_get_all() {
         const ifname = ubusMap[sid] || null;
 
         // Runtime status from hostapd or wpa_cli
-        let status = 'DISABLED';
-        if (ifname) {
+        const disabled = sec.disabled === '1';
+        let status = disabled ? 'DISABLED' : (!ifname ? 'INIT_FAILED' : 'DISABLED');
+        if (ifname && !disabled) {
             if (mode === 'ap') {
                 const hRes = await layer1.hostapd_stat(ifname, null);
                 if (hRes.ok && hRes.data.state) status = hRes.data.state;
@@ -341,6 +345,8 @@ async function iface_get_all() {
                 const wpRes = await layer1.wpa_status(ifname);
                 if (wpRes.ok && wpRes.data.wpa_state)
                     status = wpRes.data.wpa_state === 'COMPLETED' ? 'ENABLED' : wpRes.data.wpa_state;
+                else
+                    status = 'DISCONNECTED';
             }
         }
 
@@ -947,6 +953,16 @@ function parseStaMldLinks(raw) {
     return links;
 }
 
+async function uplink_scan_all() {
+    const radios = ['radio0', 'radio1', 'radio2'];
+    const results = await Promise.all(radios.map(r => uplink_scan(r).catch(() => l2ok([]))));
+    const seen = new Set();
+    const combined = [].concat(...results.map(r => r.data || []))
+        .filter(bss => { const k = bss.bssid; return seen.has(k) ? false : (seen.add(k), true); })
+        .sort((a, b) => (b.quality - a.quality) || (a.channel - b.channel));
+    return l2ok(combined);
+}
+
 async function uplink_scan(radio_id) {
     const scanRes = await layer1.iwinfo_scan(radio_id);
     if (!scanRes.ok) return l2err('iwinfo_scan failed');
@@ -1279,7 +1295,7 @@ const Layer2 = {
     // clients
     clients_get_all, clients_get_by_iface, clients_deauth,
     // uplink
-    uplink_get_all, uplink_scan, uplink_connect, uplink_disconnect, uplink_get_status,
+    uplink_get_all, uplink_scan, uplink_scan_all, uplink_connect, uplink_disconnect, uplink_get_status,
     // system
     system_get_info, system_apply, system_apply_poll, system_all_up, system_get_logs, system_get_txpower_info,
     // relayd
