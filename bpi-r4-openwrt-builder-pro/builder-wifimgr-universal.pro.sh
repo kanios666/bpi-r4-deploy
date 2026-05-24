@@ -91,6 +91,8 @@ rm -f target/linux/mediatek/patches-6.12/999-ephy-gpy211-add-mxl862xx-integrated
 # Remove mediatek copies of patches already in generic/backport-6.12
 rm -f target/linux/mediatek/patches-6.12/772-v7.1-net-dsa-move-dsa_bridge_ports-helper-to-dsa.h.patch
 rm -f target/linux/mediatek/patches-6.12/773-v7.1-net-dsa-add-bridge-member-iteration-macro.patch
+# Remove MTK SDK mxl862xx incremental patches (dangowrt backport replaces these entirely)
+rm -f target/linux/mediatek/patches-6.12/760-*.patch
 
 echo "CONFIG_NET_DSA_MXL862=y" >> .config
 
